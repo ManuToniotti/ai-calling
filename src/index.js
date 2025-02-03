@@ -64,17 +64,26 @@ fastify.get('/health', async (request, reply) => {
   reply.send({ status: 'ok' });
 });
 
+// Store active calls and their prompts
+const activeCallPrompts = new Map();
+
 // Make call endpoint
 fastify.post('/make-call', async (request, reply) => {
-  const { phoneNumber } = request.body;
+  const { phoneNumber, prompt } = request.body;
 
   try {
     const call = await twilioClient.calls.create({
       url: `https://${request.headers.host}/incoming-call`,
       to: phoneNumber,
       from: process.env.TWILIO_PHONE_NUMBER,
-      method: 'GET'
+      method: 'GET',
+      customParameters: {
+        prompt: prompt
+      }
     });
+    
+    // Store the prompt for this call
+    activeCallPrompts.set(call.sid, prompt);
 
     reply.send({ callSid: call.sid });
   } catch (error) {
@@ -154,6 +163,13 @@ fastify.register(async function (fastify) {
     // Send session configuration to OpenAI
     const sendSessionUpdate = () => {
       try {
+        // Get the custom prompt for this call if it exists
+        const customPrompt = streamSid ? activeCallPrompts.get(streamSid) : null;
+        
+        const instructions = customPrompt 
+          ? `${SYSTEM_MESSAGE}\n\nSpecific task: ${customPrompt}`
+          : SYSTEM_MESSAGE;
+
         const sessionUpdate = {
           type: 'session.update',
           session: {
@@ -161,7 +177,7 @@ fastify.register(async function (fastify) {
             input_audio_format: 'g711_ulaw',
             output_audio_format: 'g711_ulaw',
             voice: VOICE,
-            instructions: SYSTEM_MESSAGE,
+            instructions: instructions,
             modalities: ["text", "audio"],
             temperature: 0.8,
           }
@@ -278,6 +294,11 @@ fastify.register(async function (fastify) {
       console.log('Twilio WebSocket closed');
       if (openAiWs?.readyState === WebSocket.OPEN) {
         openAiWs.close();
+      }
+      
+      // Clean up stored prompt
+      if (streamSid) {
+        activeCallPrompts.delete(streamSid);
       }
       
       // Log final conversation if needed

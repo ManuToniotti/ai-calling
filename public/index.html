@@ -39,10 +39,25 @@
             margin-bottom: 20px;
         }
 
-        .call-form input[type="tel"] {
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            width: 100%;
+        }
+
+        .call-form input[type="tel"],
+        .call-form textarea {
             padding: 8px;
             font-size: 16px;
-            width: 200px;
+            width: 100%;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+
+        .call-form textarea {
+            resize: vertical;
+            min-height: 100px;
         }
 
         .call-form button {
@@ -97,9 +112,13 @@
         <h2>AI Calling Control Panel</h2>
         
         <div class="call-form">
-            <input type="tel" id="phoneNumber" placeholder="Enter phone number" 
-                   pattern="[0-9+\-\(\)\s]+" title="Please enter a valid phone number">
-            <button onclick="makeCall()">Make Call</button>
+            <div class="input-group">
+                <input type="tel" id="phoneNumber" placeholder="Enter phone number" 
+                       pattern="[0-9+\-\(\)\s]+" title="Please enter a valid phone number">
+                <textarea id="prompt" rows="4" 
+                    placeholder="Enter the prompt for the AI assistant (e.g., 'You are calling to schedule a dental appointment for next week. Ask about available times and book a slot.')"></textarea>
+                <button onclick="makeCall()">Make Call</button>
+            </div>
         </div>
 
         <button class="emergency-stop" onclick="emergencyStop()">
@@ -117,8 +136,15 @@
 
         async function makeCall() {
             const phoneNumber = document.getElementById('phoneNumber').value;
+            const prompt = document.getElementById('prompt').value;
+            
             if (!phoneNumber) {
                 showError('Please enter a phone number');
+                return;
+            }
+            
+            if (!prompt) {
+                showError('Please enter a prompt for the AI assistant');
                 return;
             }
 
@@ -128,7 +154,7 @@
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ phoneNumber })
+                    body: JSON.stringify({ phoneNumber, prompt })
                 });
 
                 const data = await response.json();
