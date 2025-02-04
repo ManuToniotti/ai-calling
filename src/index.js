@@ -193,20 +193,18 @@ fastify.register(async function (fastify) {
             const customPrompt = activeCallPrompts.get(streamSid);
             
             const sessionUpdate = {
-              type: 'session.update',
-              session: {
-                turn_detection: { 
-                  type: 'server_vad',
-                  threshold: 0.2,
-                  patience: 1.0
-                },
-                input_audio_format: 'g711_ulaw',
-                output_audio_format: 'g711_ulaw',
-                voice: VOICE,
-                instructions: customPrompt ? `${SYSTEM_MESSAGE}\n\nSpecific task: ${customPrompt}` : SYSTEM_MESSAGE,
-                modalities: ["text", "audio"],
-                temperature: 0.8,
-              }
+                type: 'session.update',
+                session: {
+                  turn_detection: { 
+                    type: 'server_vad',
+                    threshold: 0.5
+                  },
+                  input_audio_format: 'g711_ulaw',
+                  output_audio_format: 'g711_ulaw',
+                  voice: VOICE,
+                  instructions: SYSTEM_MESSAGE,
+                  modalities: ["text", "audio"]
+                }
             };
             
             openAiWs.send(JSON.stringify(sessionUpdate));
