@@ -120,194 +120,158 @@ fastify.all('/incoming-call', async (request, reply) => {
   reply.type('text/xml').send(twimlResponse);
 });
 
-// WebSocket handler for media streaming
+// Update this section in src/index.js
 fastify.register(async function (fastify) {
-  fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-    console.log('New WebSocket connection established');
-    
-    // Initialize variables for this connection
-    let streamSid = null;
-    let openAiWs = null;
-    let conversation = [];
-    let assistantMessageBuffer = '';
-
-    // Initialize OpenAI WebSocket connection
-    const initializeOpenAI = () => {
-      openAiWs = new WebSocket(
-        'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
-        {
-          headers: {
-            'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-            'OpenAI-Beta': 'realtime=v1'
-          }
-        }
-      );
-
-      openAiWs.on('open', () => {
-        console.log('Connected to OpenAI');
-        // Send session configuration after connection
-        sendSessionUpdate();
-      });
-
-      openAiWs.on('error', (error) => {
-        console.error('OpenAI WebSocket error:', error);
-      });
-
-      openAiWs.on('message', handleOpenAIMessage);
-
-      openAiWs.on('close', () => {
-        console.log('OpenAI WebSocket closed');
-      });
-    };
-
-    // Send session configuration to OpenAI
-    const sendSessionUpdate = () => {
-      try {
-        // Get the custom prompt for this call if it exists
-        const customPrompt = streamSid ? activeCallPrompts.get(streamSid) : null;
-        
-        const instructions = customPrompt 
-          ? `${SYSTEM_MESSAGE}\n\nSpecific task: ${customPrompt}`
-          : SYSTEM_MESSAGE;
-
-        const sessionUpdate = {
-          type: 'session.update',
-          session: {
-            turn_detection: { type: 'server_vad' },
-            input_audio_format: 'g711_ulaw',
-            output_audio_format: 'g711_ulaw',
-            voice: VOICE,
-            instructions: instructions,
-            modalities: ["text", "audio"],
-            temperature: 0.8,
-          }
-        };
-        
-        console.log('Sending session update to OpenAI');
-        openAiWs.send(JSON.stringify(sessionUpdate));
-      } catch (error) {
-        console.error('Error sending session update:', error);
-      }
-    };
-
-    // Handle messages from OpenAI
-    const handleOpenAIMessage = async (data) => {
-      try {
-        const response = JSON.parse(data);
-        
-        // Log important events for debugging
-        if (response.type !== 'response.audio.delta') {
-          console.log('OpenAI event:', response.type);
-        }
-
-        // Handle different types of responses
-        switch (response.type) {
-          case 'input_audio_buffer.speech_started':
-            // Cancel any ongoing response when user starts speaking
-            if (openAiWs.readyState === WebSocket.OPEN) {
-              openAiWs.send(JSON.stringify({ type: 'response.cancel' }));
-            }
-            break;
-
-          case 'response.audio.delta':
-            // Forward audio to Twilio
-            if (response.delta && streamSid) {
-              connection.socket.send(JSON.stringify({
-                event: 'media',
-                streamSid: streamSid,
-                media: { payload: response.delta }
-              }));
-            }
-            break;
-
-          case 'response.audio_transcript.delta':
-            if (response.delta) {
-              assistantMessageBuffer += response.delta;
+    fastify.get('/media-stream', { websocket: true }, (connection, req) => {
+      console.log('New WebSocket connection established');
+      
+      let streamSid = null;
+      let openAiWs = null;
+      let conversation = [];
+      let assistantMessageBuffer = '';
+  
+      // Handle messages from Twilio
+      connection.socket.on('message', (message) => {
+        try {
+          const data = JSON.parse(message.toString());
+          console.log('Received Twilio message:', data.event);
+  
+          switch (data.event) {
+            case 'start':
+              streamSid = data.start.streamSid;
+              console.log('Media stream started:', streamSid);
               
-              // Check for end of conversation
-              if (assistantMessageBuffer.includes('[END_CALL]')) {
-                const cleanMessage = assistantMessageBuffer.replace('[END_CALL]', '').trim();
-                conversation.push({ role: 'assistant', content: cleanMessage });
+              // Initialize OpenAI connection
+              openAiWs = new WebSocket(
+                'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+                {
+                  headers: {
+                    'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+                    'OpenAI-Beta': 'realtime=v1'
+                  }
+                }
+              );
+  
+              openAiWs.on('open', () => {
+                console.log('Connected to OpenAI');
+                const customPrompt = activeCallPrompts.get(streamSid);
                 
-                // Close connections after a short delay
-                setTimeout(() => {
-                  if (connection.socket.readyState === WebSocket.OPEN) {
-                    connection.socket.close();
+                const sessionUpdate = {
+                  type: 'session.update',
+                  session: {
+                    turn_detection: { 
+                      type: 'server_vad',
+                      threshold: 0.2,
+                      patience: 1.0
+                    },
+                    input_audio_format: 'g711_ulaw',
+                    output_audio_format: 'g711_ulaw',
+                    voice: VOICE,
+                    instructions: customPrompt ? `${SYSTEM_MESSAGE}\n\nSpecific task: ${customPrompt}` : SYSTEM_MESSAGE,
+                    modalities: ["text", "audio"],
+                    temperature: 0.8,
                   }
-                  if (openAiWs.readyState === WebSocket.OPEN) {
-                    openAiWs.close();
+                };
+                
+                openAiWs.send(JSON.stringify(sessionUpdate));
+              });
+  
+              openAiWs.on('message', async (data) => {
+                try {
+                  const response = JSON.parse(data.toString());
+                  console.log('OpenAI event:', response.type);
+  
+                  switch (response.type) {
+                    case 'input_audio_buffer.speech_started':
+                      if (openAiWs.readyState === WebSocket.OPEN) {
+                        openAiWs.send(JSON.stringify({ type: 'response.cancel' }));
+                      }
+                      break;
+  
+                    case 'response.audio.delta':
+                      if (response.delta && streamSid) {
+                        connection.socket.send(JSON.stringify({
+                          event: 'media',
+                          streamSid: streamSid,
+                          media: { payload: response.delta }
+                        }));
+                      }
+                      break;
+  
+                    case 'response.audio_transcript.delta':
+                      if (response.delta) {
+                        assistantMessageBuffer += response.delta;
+                        if (assistantMessageBuffer.includes('[END_CALL]')) {
+                          console.log('Call ending sequence detected');
+                          const cleanMessage = assistantMessageBuffer.replace('[END_CALL]', '').trim();
+                          conversation.push({ role: 'assistant', content: cleanMessage });
+                          
+                          // Allow time for the final message to be spoken
+                          setTimeout(() => {
+                            if (connection.socket.readyState === WebSocket.OPEN) {
+                              connection.socket.close();
+                            }
+                            if (openAiWs.readyState === WebSocket.OPEN) {
+                              openAiWs.close();
+                            }
+                          }, 3000);
+                        }
+                      }
+                      break;
+  
+                    case 'conversation.item.input_audio_transcription.completed':
+                      if (response.transcript) {
+                        conversation.push({ role: 'user', content: response.transcript.trim() });
+                      }
+                      break;
                   }
-                }, 2000);
+                } catch (error) {
+                  console.error('Error handling OpenAI message:', error);
+                }
+              });
+  
+              openAiWs.on('error', (error) => {
+                console.error('OpenAI WebSocket error:', error);
+              });
+  
+              openAiWs.on('close', (code, reason) => {
+                console.log('OpenAI WebSocket closed:', code, reason);
+              });
+              break;
+  
+            case 'media':
+              if (openAiWs?.readyState === WebSocket.OPEN) {
+                openAiWs.send(JSON.stringify({
+                  type: 'input_audio_buffer.append',
+                  audio: data.media.payload
+                }));
               }
-            }
-            break;
-
-          case 'conversation.item.input_audio_transcription.completed':
-            if (response.transcript) {
-              conversation.push({ role: 'user', content: response.transcript.trim() });
-            }
-            break;
+              break;
+  
+            case 'stop':
+              console.log('Media stream stopped');
+              if (openAiWs?.readyState === WebSocket.OPEN) {
+                openAiWs.close();
+              }
+              break;
+          }
+        } catch (error) {
+          console.error('Error handling Twilio message:', error);
         }
-      } catch (error) {
-        console.error('Error handling OpenAI message:', error);
-      }
-    };
-
-    // Handle messages from Twilio
-    connection.socket.on('message', (message) => {
-      try {
-        const data = JSON.parse(message);
-        
-        switch (data.event) {
-          case 'start':
-            streamSid = data.start.streamSid;
-            console.log('Media stream started:', streamSid);
-            // Initialize OpenAI connection when stream starts
-            initializeOpenAI();
-            break;
-
-          case 'media':
-            // Forward audio data to OpenAI
-            if (openAiWs?.readyState === WebSocket.OPEN) {
-              openAiWs.send(JSON.stringify({
-                type: 'input_audio_buffer.append',
-                audio: data.media.payload
-              }));
-            }
-            break;
-
-          case 'stop':
-            console.log('Media stream stopped');
-            // Clean up connections
-            if (openAiWs?.readyState === WebSocket.OPEN) {
-              openAiWs.close();
-            }
-            break;
+      });
+  
+      // Handle WebSocket closure
+      connection.socket.on('close', () => {
+        console.log('Twilio WebSocket closed');
+        if (openAiWs?.readyState === WebSocket.OPEN) {
+          openAiWs.close();
         }
-      } catch (error) {
-        console.error('Error handling Twilio message:', error);
-      }
-    });
-
-    // Handle WebSocket closure
-    connection.socket.on('close', () => {
-      console.log('Twilio WebSocket closed');
-      if (openAiWs?.readyState === WebSocket.OPEN) {
-        openAiWs.close();
-      }
-      
-      // Clean up stored prompt
-      if (streamSid) {
-        activeCallPrompts.delete(streamSid);
-      }
-      
-      // Log final conversation if needed
-      if (conversation.length > 0) {
-        console.log('Final conversation:', JSON.stringify(conversation, null, 2));
-      }
+        if (streamSid) {
+          activeCallPrompts.delete(streamSid);
+        }
+      });
     });
   });
-});
 
 // Start server
 const start = async () => {
