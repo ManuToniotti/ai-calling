@@ -120,9 +120,9 @@ fastify.all('/incoming-call', async (request, reply) => {
   reply.type('text/xml').send(twimlResponse);
 });
 
-// Update this section in src/index.js
+// WebSocket handler for media streaming
 fastify.register(async function (fastify) {
-    fastify.get('/media-stream', { websocket: true }, (connection, req) => {
+    fastify.get('/media-stream', { websocket: true }, function wsHandler(connection, req) {
       console.log('New WebSocket connection established');
       
       let streamSid = null;
@@ -131,9 +131,9 @@ fastify.register(async function (fastify) {
       let assistantMessageBuffer = '';
   
       // Handle messages from Twilio
-      connection.socket.on('message', (message) => {
+      connection.on('message', async function handleMessage(rawMessage) {
         try {
-          const data = JSON.parse(message.toString());
+          const data = JSON.parse(rawMessage.toString());
           console.log('Received Twilio message:', data.event);
   
           switch (data.event) {
@@ -190,7 +190,7 @@ fastify.register(async function (fastify) {
   
                     case 'response.audio.delta':
                       if (response.delta && streamSid) {
-                        connection.socket.send(JSON.stringify({
+                        connection.send(JSON.stringify({
                           event: 'media',
                           streamSid: streamSid,
                           media: { payload: response.delta }
@@ -208,10 +208,10 @@ fastify.register(async function (fastify) {
                           
                           // Allow time for the final message to be spoken
                           setTimeout(() => {
-                            if (connection.socket.readyState === WebSocket.OPEN) {
+                            if (connection.socket) {
                               connection.socket.close();
                             }
-                            if (openAiWs.readyState === WebSocket.OPEN) {
+                            if (openAiWs?.readyState === WebSocket.OPEN) {
                               openAiWs.close();
                             }
                           }, 3000);
@@ -261,7 +261,7 @@ fastify.register(async function (fastify) {
       });
   
       // Handle WebSocket closure
-      connection.socket.on('close', () => {
+      connection.on('close', () => {
         console.log('Twilio WebSocket closed');
         if (openAiWs?.readyState === WebSocket.OPEN) {
           openAiWs.close();
@@ -270,6 +270,7 @@ fastify.register(async function (fastify) {
           activeCallPrompts.delete(streamSid);
         }
       });
+  
     });
   });
 
