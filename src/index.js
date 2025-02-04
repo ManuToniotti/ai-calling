@@ -129,54 +129,12 @@ fastify.register(async function (fastify) {
       let openAiWs = null;
       let conversation = [];
       let assistantMessageBuffer = '';
-      let mediaMessageCount = 0; // Counter for media messages
+      let currentResponseId = null;
+      let currentMessageId = null;
+      let mediaMessageCount = 0;
   
-      // Handle messages from Twilio
-      connection.on('message', async function handleMessage(rawMessage) {
-        try {
-          const data = JSON.parse(rawMessage.toString());
-          
-          // Only log non-media messages or every 50th media message
-          if (data.event !== 'media' || mediaMessageCount % 50 === 0) {
-            console.log('Received Twilio message:', data.event);
-          }
-          
-          if (data.event === 'media') {
-            mediaMessageCount++;
-          }
-  
-          switch (data.event) {
-            case 'start':
-              streamSid = data.start.streamSid;
-              console.log('Media stream started:', streamSid);
-              
-              // Initialize OpenAI connection with retry logic
-              initializeOpenAI();
-              break;
-  
-            case 'media':
-              if (openAiWs?.readyState === WebSocket.OPEN) {
-                openAiWs.send(JSON.stringify({
-                  type: 'input_audio_buffer.append',
-                  audio: data.media.payload
-                }));
-              }
-              break;
-  
-            case 'stop':
-              console.log('Media stream stopped');
-              if (openAiWs?.readyState === WebSocket.OPEN) {
-                openAiWs.close();
-              }
-              break;
-          }
-        } catch (error) {
-          console.error('Error handling Twilio message:', error);
-        }
-      });
-  
-      // Initialize OpenAI with retry logic
-      function initializeOpenAI(retryCount = 0) {
+      // Initialize OpenAI connection
+      function initializeOpenAI() {
         try {
           openAiWs = new WebSocket(
             'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
@@ -193,18 +151,18 @@ fastify.register(async function (fastify) {
             const customPrompt = activeCallPrompts.get(streamSid);
             
             const sessionUpdate = {
-                type: 'session.update',
-                session: {
-                  turn_detection: { 
-                    type: 'server_vad',
-                    threshold: 0.5
-                  },
-                  input_audio_format: 'g711_ulaw',
-                  output_audio_format: 'g711_ulaw',
-                  voice: VOICE,
-                  instructions: SYSTEM_MESSAGE,
-                  modalities: ["text", "audio"]
-                }
+              type: 'session.update',
+              session: {
+                turn_detection: { 
+                  type: 'server_vad',
+                  threshold: 0.5
+                },
+                input_audio_format: 'g711_ulaw',
+                output_audio_format: 'g711_ulaw',
+                voice: VOICE,
+                instructions: customPrompt ? `${SYSTEM_MESSAGE}\n\nSpecific task: ${customPrompt}` : SYSTEM_MESSAGE,
+                modalities: ["text", "audio"]
+              }
             };
             
             openAiWs.send(JSON.stringify(sessionUpdate));
@@ -214,23 +172,44 @@ fastify.register(async function (fastify) {
             try {
               const response = JSON.parse(data.toString());
               
-              // Only log non-audio events
+              // Only log non-media events
               if (response.type !== 'response.audio.delta') {
                 console.log('OpenAI event:', response.type);
               }
   
               switch (response.type) {
-                case 'error':
-                  console.error('OpenAI error:', response);
-                  if (retryCount < 3) {
-                    console.log(`Retrying OpenAI connection (attempt ${retryCount + 1})...`);
-                    setTimeout(() => initializeOpenAI(retryCount + 1), 1000);
+                case 'response.created':
+                  currentResponseId = response.response.id;
+                  console.log('New response started:', currentResponseId);
+                  break;
+  
+                case 'response.output_item.added':
+                  if (response.item) {
+                    currentMessageId = response.item.id;
+                    console.log('New message item:', currentMessageId);
                   }
                   break;
   
                 case 'input_audio_buffer.speech_started':
+                  console.log('Speech detected, canceling current response');
                   if (openAiWs.readyState === WebSocket.OPEN) {
-                    openAiWs.send(JSON.stringify({ type: 'response.cancel' }));
+                    // Try to cancel current response
+                    if (currentResponseId) {
+                      openAiWs.send(JSON.stringify({
+                        type: 'response.cancel',
+                        response_id: currentResponseId
+                      }));
+                    }
+                    
+                    // Also truncate current message if exists
+                    if (currentMessageId) {
+                      openAiWs.send(JSON.stringify({
+                        type: 'conversation.item.truncate',
+                        item_id: currentMessageId,
+                        content_index: 0,
+                        audio_end_ms: Date.now()  // Truncate at current time
+                      }));
+                    }
                   }
                   break;
   
@@ -266,6 +245,11 @@ fastify.register(async function (fastify) {
                   }
                   break;
   
+                case 'response.done':
+                  currentResponseId = null;
+                  currentMessageId = null;
+                  break;
+  
                 case 'conversation.item.input_audio_transcription.completed':
                   if (response.transcript) {
                     conversation.push({ role: 'user', content: response.transcript.trim() });
@@ -280,28 +264,58 @@ fastify.register(async function (fastify) {
   
           openAiWs.on('error', (error) => {
             console.error('OpenAI WebSocket error:', error);
-            if (retryCount < 3) {
-              console.log(`Retrying OpenAI connection (attempt ${retryCount + 1})...`);
-              setTimeout(() => initializeOpenAI(retryCount + 1), 1000);
-            }
           });
   
           openAiWs.on('close', (code, reason) => {
             console.log('OpenAI WebSocket closed:', code, reason ? reason.toString() : '');
-            if (code !== 1000 && retryCount < 3) {
-              console.log(`Retrying OpenAI connection (attempt ${retryCount + 1})...`);
-              setTimeout(() => initializeOpenAI(retryCount + 1), 1000);
-            }
           });
   
         } catch (error) {
           console.error('Error initializing OpenAI connection:', error);
-          if (retryCount < 3) {
-            console.log(`Retrying OpenAI connection (attempt ${retryCount + 1})...`);
-            setTimeout(() => initializeOpenAI(retryCount + 1), 1000);
-          }
         }
       }
+  
+      // Handle messages from Twilio
+      connection.on('message', async function handleMessage(rawMessage) {
+        try {
+          const data = JSON.parse(rawMessage.toString());
+          
+          // Only log non-media messages or every 50th media message
+          if (data.event !== 'media' || mediaMessageCount % 50 === 0) {
+            console.log('Received Twilio message:', data.event);
+          }
+          
+          if (data.event === 'media') {
+            mediaMessageCount++;
+          }
+  
+          switch (data.event) {
+            case 'start':
+              streamSid = data.start.streamSid;
+              console.log('Media stream started:', streamSid);
+              initializeOpenAI();
+              break;
+  
+            case 'media':
+              if (openAiWs?.readyState === WebSocket.OPEN) {
+                openAiWs.send(JSON.stringify({
+                  type: 'input_audio_buffer.append',
+                  audio: data.media.payload
+                }));
+              }
+              break;
+  
+            case 'stop':
+              console.log('Media stream stopped');
+              if (openAiWs?.readyState === WebSocket.OPEN) {
+                openAiWs.close();
+              }
+              break;
+          }
+        } catch (error) {
+          console.error('Error handling Twilio message:', error);
+        }
+      });
   
       // Handle WebSocket closure
       connection.on('close', () => {
