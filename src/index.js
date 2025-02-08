@@ -351,7 +351,7 @@ fastify.register(async function (fastify) {
     }
 
     // Handle Twilio messages
-    connection.socket.on('message', async function handleMessage(rawMessage) {
+    connection.on('message', async function handleMessage(rawMessage) {
       try {
         const data = JSON.parse(rawMessage.toString());
         
@@ -391,7 +391,7 @@ fastify.register(async function (fastify) {
     });
 
     // Handle WebSocket closure
-    connection.socket.on('close', () => {
+    connection.on('close', () => {
       console.log('Twilio WebSocket closed');
       if (openAiWs?.readyState === WebSocket.OPEN) {
         openAiWs.close();
