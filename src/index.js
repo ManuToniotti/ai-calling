@@ -243,11 +243,17 @@ fastify.register(async function (fastify) {
                   if (openAiWs.readyState === WebSocket.OPEN) {
                     console.log('User started speaking - canceling AI response');
                     
+                    // If there's a current incomplete message, save it
+                    if (completeMessage.trim()) {
+                      conversation.push({ role: 'assistant', content: completeMessage.trim() });
+                      completeMessage = '';
+                    }
+
                     // Send cancel response
                     openAiWs.send(JSON.stringify({
                       type: 'response.cancel'
                     }));
-                
+
                     // Clear the media buffer
                     if (streamSid) {
                       connection.send(JSON.stringify({
@@ -255,25 +261,24 @@ fastify.register(async function (fastify) {
                         streamSid: streamSid
                       }));
                     }
-                
-                    // Reset message tracking
-                    completeMessage = '';
                   }
                   break;
 
-              case 'input_audio_buffer.speech_stopped':
-                isSpeaking = false;
-                break;
+                case 'input_audio_buffer.speech_stopped':
+                  isSpeaking = false;
+                  // The conversation can continue naturally after user stops speaking
+                  break;
 
-              case 'response.audio.delta':
-                if (response.delta && streamSid && !isSpeaking) {
-                  connection.send(JSON.stringify({
-                    event: 'media',
-                    streamSid: streamSid,
-                    media: { payload: response.delta }
-                  }));
-                }
-                break;
+                case 'conversation.item.input_audio_transcription.completed':
+                  if (response.transcript) {
+                    const userMessage = response.transcript.trim();
+                    if (userMessage) {
+                      console.log('User:', userMessage);
+                      // Add user message to conversation history
+                      conversation.push({ role: 'user', content: userMessage });
+                    }
+                  }
+                  break;
 
               case 'response.audio_transcript.delta':
                 if (response.delta) {
