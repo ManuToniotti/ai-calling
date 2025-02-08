@@ -159,10 +159,7 @@ fastify.register(async function (fastify) {
     let currentMessageId = null;
     let completeMessage = '';
     let isSpeaking = false;
-
-    function createSystemMessage(customPrompt) {
-      return customPrompt || 'No specific task provided.';
-    }
+    let isProcessingTranscript = false;
 
     // Initialize OpenAI connection
     function initializeOpenAI() {
@@ -176,52 +173,35 @@ fastify.register(async function (fastify) {
             }
           }
         );
-    
+
         openAiWs.on('open', () => {
           console.log('Connected to OpenAI');
-          let prompt = null;
-    
-          // Check for prompt in various places
-          if (streamSid) {
-            const callSid = streamToCallSid.get(streamSid);
-            if (callSid) {
-              const storedPromptData = activeCallPrompts.get(callSid);
-              if (storedPromptData && !storedPromptData.used) {
-                prompt = storedPromptData.prompt;
-                storedPromptData.used = true;  // Mark as used
-                console.log('Using stored prompt for call:', prompt);
-              }
-            }
+          const callSid = streamToCallSid.get(streamSid);
+          const customPrompt = callSid ? activeCallPrompts.get(callSid) : null;
+          
+          if (customPrompt) {
+            console.log('Using stored prompt for call:', customPrompt);
           }
-    
-          // Create comprehensive system message
-          const systemMessage = `${SYSTEM_MESSAGE}
-          
-          Your specific task for this call is: ${prompt || 'No specific task provided.'}
-          
-          Remember to:
-          1. Focus on completing this specific task
-          2. Be professional and courteous
-          3. End the call appropriately when the task is complete`;
           
           const sessionUpdate = {
             type: 'session.update',
             session: {
               turn_detection: { 
                 type: 'server_vad',
-                threshold: 0.5
+                threshold: 0.5,
+                silence_duration_ms: 400,
+                prefix_padding_ms: 200
               },
               input_audio_format: 'g711_ulaw',
               output_audio_format: 'g711_ulaw',
               voice: VOICE,
-              instructions: systemMessage,
+              instructions: createSystemMessage(customPrompt),
               modalities: ["text", "audio"]
             }
           };
           
           openAiWs.send(JSON.stringify(sessionUpdate));
         });
-    
 
         openAiWs.on('message', async (data) => {
           try {
@@ -240,23 +220,28 @@ fastify.register(async function (fastify) {
 
               case 'input_audio_buffer.speech_started':
                 isSpeaking = true;
-                if (openAiWs.readyState === WebSocket.OPEN && currentResponseId) {
+                if (openAiWs.readyState === WebSocket.OPEN) {
                   console.log('User started speaking - canceling AI response');
                   
-                  // Send both cancel and truncate commands
-                  openAiWs.send(JSON.stringify({
-                    type: 'response.cancel',
-                    response_id: currentResponseId
-                  }));
-
-                  if (currentMessageId) {
+                  // Cancel the current response
+                  if (currentResponseId) {
                     openAiWs.send(JSON.stringify({
-                      type: 'conversation.item.truncate',
-                      item_id: currentMessageId,
-                      content_index: 0,
-                      audio_end_ms: Date.now()
+                      type: 'response.cancel',
+                      response_id: currentResponseId
                     }));
                   }
+
+                  // Clear the media buffer
+                  if (streamSid) {
+                    connection.send(JSON.stringify({
+                      event: 'clear',
+                      streamSid: streamSid
+                    }));
+                  }
+
+                  // Reset message tracking
+                  completeMessage = '';
+                  currentMessageId = null;
                 }
                 break;
 
@@ -275,12 +260,15 @@ fastify.register(async function (fastify) {
                 break;
 
               case 'response.audio_transcript.delta':
-                if (response.delta) {
+                if (response.delta && !isSpeaking) {
                   completeMessage += response.delta;
                   
                   if (completeMessage.match(/[.!?](\s|$)/)) {
-                    console.log('Assistant:', completeMessage.trim());
-                    conversation.push({ role: 'assistant', content: completeMessage.trim() });
+                    const message = completeMessage.trim();
+                    if (message && !conversation.some(msg => msg.content === message)) {
+                      console.log('Assistant:', message);
+                      conversation.push({ role: 'assistant', content: message });
+                    }
                     completeMessage = '';
                   }
                   
@@ -299,17 +287,28 @@ fastify.register(async function (fastify) {
                 break;
 
               case 'conversation.item.input_audio_transcription.completed':
-                if (response.transcript) {
+              case 'input_audio_buffer.transcription.completed':
+                if (response.transcript && !isProcessingTranscript) {
+                  isProcessingTranscript = true;
                   const userMessage = response.transcript.trim();
                   if (userMessage) {
                     console.log('User:', userMessage);
-                    conversation.push({ role: 'user', content: userMessage });
+                    // Check for duplicate messages
+                    if (!conversation.some(msg => 
+                      msg.role === 'user' && msg.content === userMessage
+                    )) {
+                      conversation.push({ role: 'user', content: userMessage });
+                    }
                   }
+                  isProcessingTranscript = false;
                 }
                 break;
 
               case 'error':
-                console.error('OpenAI error:', response.error);
+                if (!response.error?.message?.includes('Cancellation failed') && 
+                    !response.error?.message?.includes('Audio content')) {
+                  console.error('OpenAI error:', response.error);
+                }
                 break;
             }
           } catch (error) {
@@ -324,7 +323,7 @@ fastify.register(async function (fastify) {
         openAiWs.on('close', (code, reason) => {
           console.log('OpenAI WebSocket closed:', code, reason ? reason.toString() : '');
           
-          // Clean up maps
+          // Clean up prompts and mappings
           const callSid = streamToCallSid.get(streamSid);
           if (callSid) {
             activeCallPrompts.delete(callSid);
