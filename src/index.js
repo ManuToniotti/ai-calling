@@ -75,14 +75,18 @@ fastify.post('/make-call', async (request, reply) => {
   try {
     console.log('Making call with prompt:', prompt);
     const call = await twilioClient.calls.create({
-      url: `https://${request.headers.host}/incoming-call`,
+      url: `https://${request.headers.host}/incoming-call?prompt=${encodeURIComponent(prompt)}`,  // Add prompt to URL
       to: phoneNumber,
       from: process.env.TWILIO_PHONE_NUMBER,
       method: 'GET'
     });
     
-    // Store the prompt with the call SID
-    activeCallPrompts.set(call.sid, prompt);
+    // Store the prompt with timestamp
+    activeCallPrompts.set(call.sid, {
+      prompt,
+      timestamp: new Date(),
+      used: false  // Track if prompt has been used
+    });
     console.log('Stored prompt for call:', call.sid);
     
     reply.send({ callSid: call.sid });
@@ -110,20 +114,38 @@ fastify.post('/emergency-stop', async (request, reply) => {
 
 // Twilio webhook route for incoming calls
 fastify.all('/incoming-call', async (request, reply) => {
-  // Get the callSid from Twilio's request
   const callSid = request.query.CallSid;
+  const prompt = request.query.prompt;
+  
   console.log('Incoming call with SID:', callSid);
+
+  // Escape XML special characters
+  const escapeXml = (unsafe) => {
+    return unsafe.replace(/[<>&'"]/g, (c) => {
+      switch (c) {
+        case '<': return '&lt;';
+        case '>': return '&gt;';
+        case '&': return '&amp;';
+        case "'": return '&apos;';
+        case '"': return '&quot;';
+      }
+    });
+  };
+
+  const escapedPrompt = prompt ? escapeXml(prompt) : '';
 
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
       <Connect>
-        <Stream url="wss://${request.headers.host}/media-stream" />
+        <Stream url="wss://${request.headers.host}/media-stream">
+          <Parameter name="CallSid" value="${callSid}"/>
+          <Parameter name="Prompt" value="${escapedPrompt}"/>
+        </Stream>
       </Connect>
     </Response>`;
   
   reply.type('text/xml').send(twimlResponse);
 });
-
 
 // WebSocket handler for media streaming
 fastify.register(async function (fastify) {
@@ -154,17 +176,33 @@ fastify.register(async function (fastify) {
             }
           }
         );
-
+    
         openAiWs.on('open', () => {
           console.log('Connected to OpenAI');
-          const callSid = streamToCallSid.get(streamSid);
-          const customPrompt = callSid ? activeCallPrompts.get(callSid) : null;
-          
-          if (customPrompt) {
-            console.log('Using prompt for call:', customPrompt);
-          } else {
-            console.log('No prompt found for call');
+          let prompt = null;
+    
+          // Check for prompt in various places
+          if (streamSid) {
+            const callSid = streamToCallSid.get(streamSid);
+            if (callSid) {
+              const storedPromptData = activeCallPrompts.get(callSid);
+              if (storedPromptData && !storedPromptData.used) {
+                prompt = storedPromptData.prompt;
+                storedPromptData.used = true;  // Mark as used
+                console.log('Using stored prompt for call:', prompt);
+              }
+            }
           }
+    
+          // Create comprehensive system message
+          const systemMessage = `${SYSTEM_MESSAGE}
+          
+          Your specific task for this call is: ${prompt || 'No specific task provided.'}
+          
+          Remember to:
+          1. Focus on completing this specific task
+          2. Be professional and courteous
+          3. End the call appropriately when the task is complete`;
           
           const sessionUpdate = {
             type: 'session.update',
@@ -176,13 +214,14 @@ fastify.register(async function (fastify) {
               input_audio_format: 'g711_ulaw',
               output_audio_format: 'g711_ulaw',
               voice: VOICE,
-              instructions: createSystemMessage(customPrompt),
+              instructions: systemMessage,
               modalities: ["text", "audio"]
             }
           };
           
           openAiWs.send(JSON.stringify(sessionUpdate));
         });
+    
 
         openAiWs.on('message', async (data) => {
           try {
@@ -315,9 +354,21 @@ fastify.register(async function (fastify) {
           case 'start':
             streamSid = data.start.streamSid;
             // Get CallSid from start event's customParameters
-            if (data.start.customParameters?.CallSid) {
-              streamToCallSid.set(streamSid, data.start.customParameters.CallSid);
-              console.log('Mapped stream', streamSid, 'to call', data.start.customParameters.CallSid);
+            const callSid = data.start.customParameters?.CallSid;
+            const promptFromParams = data.start.customParameters?.Prompt;
+            
+            if (callSid) {
+              streamToCallSid.set(streamSid, callSid);
+              console.log('Mapped stream', streamSid, 'to call', callSid);
+              
+              // If we have a prompt in parameters but not in storage, store it
+              if (promptFromParams && !activeCallPrompts.has(callSid)) {
+                activeCallPrompts.set(callSid, {
+                  prompt: promptFromParams,
+                  timestamp: new Date(),
+                  used: false
+                });
+              }
             }
             console.log('Media stream started:', streamSid);
             initializeOpenAI();
