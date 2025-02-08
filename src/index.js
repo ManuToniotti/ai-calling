@@ -230,70 +230,70 @@ fastify.register(async function (fastify) {
             switch (response.type) {
               case 'response.created':
                 currentResponseId = response.response.id;
+                console.log('New response started:', currentResponseId);
                 break;
-
+            
               case 'response.output_item.added':
                 if (response.item) {
                   currentMessageId = response.item.id;
                 }
                 break;
-
-                case 'input_audio_buffer.speech_started':
-                  isSpeaking = true;
-                  if (openAiWs.readyState === WebSocket.OPEN) {
-                    console.log('User started speaking - canceling AI response');
-                    
-                    // If there's a current incomplete message, save it
-                    if (completeMessage.trim()) {
-                      conversation.push({ role: 'assistant', content: completeMessage.trim() });
-                      completeMessage = '';
-                    }
-
-                    // Send cancel response
-                    openAiWs.send(JSON.stringify({
-                      type: 'response.cancel'
+            
+              case 'input_audio_buffer.speech_started':
+                isSpeaking = true;
+                if (openAiWs.readyState === WebSocket.OPEN) {
+                  console.log('User started speaking - canceling AI response');
+                  
+                  // If there's a current incomplete message, save it
+                  if (completeMessage.trim()) {
+                    conversation.push({ role: 'assistant', content: completeMessage.trim() });
+                    completeMessage = '';
+                  }
+            
+                  // Send cancel response
+                  openAiWs.send(JSON.stringify({
+                    type: 'response.cancel'
+                  }));
+            
+                  // Clear the media buffer
+                  if (streamSid) {
+                    connection.send(JSON.stringify({
+                      event: 'clear',
+                      streamSid: streamSid
                     }));
-
-                    // Clear the media buffer
-                    if (streamSid) {
-                      connection.send(JSON.stringify({
-                        event: 'clear',
-                        streamSid: streamSid
-                      }));
-                    }
                   }
-                  break;
-
-                case 'input_audio_buffer.speech_stopped':
-                  isSpeaking = false;
-                  // The conversation can continue naturally after user stops speaking
-                  break;
-
-                case 'conversation.item.input_audio_transcription.completed':
-                  if (response.transcript) {
-                    const userMessage = response.transcript.trim();
-                    if (userMessage) {
-                      console.log('User:', userMessage);
-                      // Add user message to conversation history
-                      conversation.push({ role: 'user', content: userMessage });
-                    }
-                  }
-                  break;
-
+                }
+                break;
+            
+              case 'input_audio_buffer.speech_stopped':
+                isSpeaking = false;
+                break;
+            
+              case 'response.audio.delta':
+                if (response.delta && streamSid && !isSpeaking) {
+                  connection.send(JSON.stringify({
+                    event: 'media',
+                    streamSid: streamSid,
+                    media: { payload: response.delta }
+                  }));
+                }
+                break;
+            
               case 'response.audio_transcript.delta':
-                if (response.delta) {
+                if (response.delta && !isSpeaking) {
                   completeMessage += response.delta;
                   
                   if (completeMessage.match(/[.!?](\s|$)/)) {
-                    console.log('Assistant:', completeMessage.trim());
-                    conversation.push({ role: 'assistant', content: completeMessage.trim() });
+                    const message = completeMessage.trim();
+                    console.log('Assistant:', message);
+                    conversation.push({ role: 'assistant', content: message });
                     completeMessage = '';
                   }
                   
                   if (completeMessage.includes('[END_CALL]')) {
                     console.log('Call ending sequence detected');
                     setTimeout(() => {
-                      if (connection.socket) {
+                      if (connection.socket?.readyState === WebSocket.OPEN) {
                         connection.socket.close();
                       }
                       if (openAiWs?.readyState === WebSocket.OPEN) {
@@ -303,7 +303,7 @@ fastify.register(async function (fastify) {
                   }
                 }
                 break;
-
+            
               case 'conversation.item.input_audio_transcription.completed':
                 if (response.transcript) {
                   const userMessage = response.transcript.trim();
@@ -313,7 +313,7 @@ fastify.register(async function (fastify) {
                   }
                 }
                 break;
-
+            
               case 'error':
                 console.error('OpenAI error:', response.error);
                 break;
