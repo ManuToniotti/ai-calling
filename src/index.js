@@ -64,27 +64,27 @@ fastify.get('/health', async (request, reply) => {
   reply.send({ status: 'ok' });
 });
 
-// Store active calls and their prompts
+// First, let's create a proper prompt mapping
+const streamToCallSid = new Map();
 const activeCallPrompts = new Map();
 
-// Make call endpoint
+// Update make-call endpoint
 fastify.post('/make-call', async (request, reply) => {
   const { phoneNumber, prompt } = request.body;
 
   try {
+    console.log('Making call with prompt:', prompt);
     const call = await twilioClient.calls.create({
       url: `https://${request.headers.host}/incoming-call`,
       to: phoneNumber,
       from: process.env.TWILIO_PHONE_NUMBER,
-      method: 'GET',
-      customParameters: {
-        prompt: prompt
-      }
+      method: 'GET'
     });
     
-    // Store the prompt for this call
+    // Store the prompt with the call SID
     activeCallPrompts.set(call.sid, prompt);
-
+    console.log('Stored prompt for call:', call.sid);
+    
     reply.send({ callSid: call.sid });
   } catch (error) {
     console.error('Error making call:', error);
@@ -110,6 +110,10 @@ fastify.post('/emergency-stop', async (request, reply) => {
 
 // Twilio webhook route for incoming calls
 fastify.all('/incoming-call', async (request, reply) => {
+  // Get the callSid from Twilio's request
+  const callSid = request.query.CallSid;
+  console.log('Incoming call with SID:', callSid);
+
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
       <Connect>
@@ -119,6 +123,7 @@ fastify.all('/incoming-call', async (request, reply) => {
   
   reply.type('text/xml').send(twimlResponse);
 });
+
 
 // WebSocket handler for media streaming
 fastify.register(async function (fastify) {
@@ -130,31 +135,11 @@ fastify.register(async function (fastify) {
     let conversation = [];
     let currentResponseId = null;
     let currentMessageId = null;
-    let isFirstMessage = true;
     let completeMessage = '';
+    let isSpeaking = false;
 
     function createSystemMessage(customPrompt) {
-      const baseMessage = `You are an AI assistant making phone calls. 
-Focus on these key points:
-1. You are ALWAYS the caller, never pretend to be the receiving end
-2. Stay focused on the specific task provided in the prompt
-3. Be direct and professional
-4. If you reach the task's objective or need to end:
-   - Politely conclude
-   - Thank them for their time
-   - End with [END_CALL]`;
-
-      return customPrompt 
-        ? `${baseMessage}\n\nYOUR SPECIFIC TASK:\n${customPrompt}\n\nRemember: Complete this task exactly as specified. Do not deviate from the given objective.`
-        : baseMessage;
-    }
-
-    function logConversation(role, message) {
-      // Only log complete thoughts/sentences
-      if (message.trim() && message.match(/[.!?]$/)) {
-        console.log(`${role}: ${message.trim()}`);
-        conversation.push({ role, content: message.trim() });
-      }
+      return customPrompt || 'No specific task provided.';
     }
 
     // Initialize OpenAI connection
@@ -172,7 +157,14 @@ Focus on these key points:
 
         openAiWs.on('open', () => {
           console.log('Connected to OpenAI');
-          const customPrompt = activeCallPrompts.get(streamSid);
+          const callSid = streamToCallSid.get(streamSid);
+          const customPrompt = callSid ? activeCallPrompts.get(callSid) : null;
+          
+          if (customPrompt) {
+            console.log('Using prompt for call:', customPrompt);
+          } else {
+            console.log('No prompt found for call');
+          }
           
           const sessionUpdate = {
             type: 'session.update',
@@ -195,11 +187,6 @@ Focus on these key points:
         openAiWs.on('message', async (data) => {
           try {
             const response = JSON.parse(data.toString());
-            
-            // Only log significant events
-            if (['session.created', 'session.updated', 'error'].includes(response.type)) {
-              console.log('OpenAI event:', response.type);
-            }
 
             switch (response.type) {
               case 'response.created':
@@ -213,15 +200,16 @@ Focus on these key points:
                 break;
 
               case 'input_audio_buffer.speech_started':
-                if (openAiWs.readyState === WebSocket.OPEN) {
-                  console.log('User speaking - interrupting assistant');
-                  if (currentResponseId) {
-                    openAiWs.send(JSON.stringify({
-                      type: 'response.cancel',
-                      response_id: currentResponseId
-                    }));
-                  }
+                isSpeaking = true;
+                if (openAiWs.readyState === WebSocket.OPEN && currentResponseId) {
+                  console.log('User started speaking - canceling AI response');
                   
+                  // Send both cancel and truncate commands
+                  openAiWs.send(JSON.stringify({
+                    type: 'response.cancel',
+                    response_id: currentResponseId
+                  }));
+
                   if (currentMessageId) {
                     openAiWs.send(JSON.stringify({
                       type: 'conversation.item.truncate',
@@ -233,8 +221,12 @@ Focus on these key points:
                 }
                 break;
 
+              case 'input_audio_buffer.speech_stopped':
+                isSpeaking = false;
+                break;
+
               case 'response.audio.delta':
-                if (response.delta && streamSid) {
+                if (response.delta && streamSid && !isSpeaking) {
                   connection.send(JSON.stringify({
                     event: 'media',
                     streamSid: streamSid,
@@ -247,15 +239,14 @@ Focus on these key points:
                 if (response.delta) {
                   completeMessage += response.delta;
                   
-                  // Only log when we have a complete thought/sentence
                   if (completeMessage.match(/[.!?](\s|$)/)) {
-                    logConversation('assistant', completeMessage);
+                    console.log('Assistant:', completeMessage.trim());
+                    conversation.push({ role: 'assistant', content: completeMessage.trim() });
                     completeMessage = '';
                   }
                   
                   if (completeMessage.includes('[END_CALL]')) {
                     console.log('Call ending sequence detected');
-                    
                     setTimeout(() => {
                       if (connection.socket) {
                         connection.socket.close();
@@ -268,14 +259,13 @@ Focus on these key points:
                 }
                 break;
 
-              case 'response.done':
-                currentResponseId = null;
-                currentMessageId = null;
-                break;
-
               case 'conversation.item.input_audio_transcription.completed':
                 if (response.transcript) {
-                  logConversation('user', response.transcript.trim());
+                  const userMessage = response.transcript.trim();
+                  if (userMessage) {
+                    console.log('User:', userMessage);
+                    conversation.push({ role: 'user', content: userMessage });
+                  }
                 }
                 break;
 
@@ -295,9 +285,16 @@ Focus on these key points:
         openAiWs.on('close', (code, reason) => {
           console.log('OpenAI WebSocket closed:', code, reason ? reason.toString() : '');
           
-          // Log final conversation for record keeping
+          // Clean up maps
+          const callSid = streamToCallSid.get(streamSid);
+          if (callSid) {
+            activeCallPrompts.delete(callSid);
+            streamToCallSid.delete(streamSid);
+          }
+
+          // Log final conversation
           if (conversation.length > 0) {
-            console.log('Final conversation transcript:');
+            console.log('\nFinal conversation transcript:');
             conversation.forEach(msg => {
               console.log(`${msg.role}: ${msg.content}`);
             });
@@ -314,14 +311,14 @@ Focus on these key points:
       try {
         const data = JSON.parse(rawMessage.toString());
         
-        // Only log non-media messages
-        if (data.event !== 'media') {
-          console.log('Twilio event:', data.event);
-        }
-
         switch (data.event) {
           case 'start':
             streamSid = data.start.streamSid;
+            // Get CallSid from start event's customParameters
+            if (data.start.customParameters?.CallSid) {
+              streamToCallSid.set(streamSid, data.start.customParameters.CallSid);
+              console.log('Mapped stream', streamSid, 'to call', data.start.customParameters.CallSid);
+            }
             console.log('Media stream started:', streamSid);
             initializeOpenAI();
             break;
@@ -352,9 +349,6 @@ Focus on these key points:
       console.log('Twilio WebSocket closed');
       if (openAiWs?.readyState === WebSocket.OPEN) {
         openAiWs.close();
-      }
-      if (streamSid) {
-        activeCallPrompts.delete(streamSid);
       }
     });
   });
