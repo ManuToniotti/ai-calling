@@ -147,7 +147,7 @@ fastify.all('/incoming-call', async (request, reply) => {
   reply.type('text/xml').send(twimlResponse);
 });
 
-// WebSocket handler for media streaming
+// WebSocket handler
 fastify.register(async function (fastify) {
   fastify.get('/media-stream', { websocket: true }, function wsHandler(connection, req) {
     console.log('New WebSocket connection established');
@@ -176,13 +176,21 @@ fastify.register(async function (fastify) {
 
         openAiWs.on('open', () => {
           console.log('Connected to OpenAI');
-          const callSid = streamToCallSid.get(streamSid);
-          const customPrompt = callSid ? activeCallPrompts.get(callSid) : null;
+          let prompt = null;
           
-          if (customPrompt) {
-            console.log('Using stored prompt for call:', customPrompt);
+          // Get prompt from stored data
+          if (streamSid) {
+            const callSid = streamToCallSid.get(streamSid);
+            if (callSid) {
+              const storedPromptData = activeCallPrompts.get(callSid);
+              if (storedPromptData && !storedPromptData.used) {
+                prompt = storedPromptData.prompt;
+                console.log('Using stored prompt for call:', prompt);
+              }
+            }
           }
-          
+
+          // Send session update
           const sessionUpdate = {
             type: 'session.update',
             session: {
@@ -195,7 +203,7 @@ fastify.register(async function (fastify) {
               input_audio_format: 'g711_ulaw',
               output_audio_format: 'g711_ulaw',
               voice: VOICE,
-              instructions: createSystemMessage(customPrompt),
+              instructions: customPrompt ? `${SYSTEM_MESSAGE}\n\nYour specific task for this call is: ${customPrompt}` : SYSTEM_MESSAGE,
               modalities: ["text", "audio"]
             }
           };
@@ -241,7 +249,6 @@ fastify.register(async function (fastify) {
 
                   // Reset message tracking
                   completeMessage = '';
-                  currentMessageId = null;
                 }
                 break;
 
@@ -275,7 +282,7 @@ fastify.register(async function (fastify) {
                   if (completeMessage.includes('[END_CALL]')) {
                     console.log('Call ending sequence detected');
                     setTimeout(() => {
-                      if (connection.socket) {
+                      if (connection.socket.readyState === WebSocket.OPEN) {
                         connection.socket.close();
                       }
                       if (openAiWs?.readyState === WebSocket.OPEN) {
@@ -293,7 +300,6 @@ fastify.register(async function (fastify) {
                   const userMessage = response.transcript.trim();
                   if (userMessage) {
                     console.log('User:', userMessage);
-                    // Check for duplicate messages
                     if (!conversation.some(msg => 
                       msg.role === 'user' && msg.content === userMessage
                     )) {
@@ -323,14 +329,14 @@ fastify.register(async function (fastify) {
         openAiWs.on('close', (code, reason) => {
           console.log('OpenAI WebSocket closed:', code, reason ? reason.toString() : '');
           
-          // Clean up prompts and mappings
-          const callSid = streamToCallSid.get(streamSid);
-          if (callSid) {
-            activeCallPrompts.delete(callSid);
-            streamToCallSid.delete(streamSid);
+          if (streamSid) {
+            const callSid = streamToCallSid.get(streamSid);
+            if (callSid) {
+              activeCallPrompts.delete(callSid);
+              streamToCallSid.delete(streamSid);
+            }
           }
 
-          // Log final conversation
           if (conversation.length > 0) {
             console.log('\nFinal conversation transcript:');
             conversation.forEach(msg => {
@@ -344,31 +350,21 @@ fastify.register(async function (fastify) {
       }
     }
 
-    // Handle messages from Twilio
-    connection.on('message', async function handleMessage(rawMessage) {
+    // Handle Twilio messages
+    connection.socket.on('message', async function handleMessage(rawMessage) {
       try {
         const data = JSON.parse(rawMessage.toString());
         
         switch (data.event) {
           case 'start':
             streamSid = data.start.streamSid;
-            // Get CallSid from start event's customParameters
             const callSid = data.start.customParameters?.CallSid;
-            const promptFromParams = data.start.customParameters?.Prompt;
             
             if (callSid) {
               streamToCallSid.set(streamSid, callSid);
               console.log('Mapped stream', streamSid, 'to call', callSid);
-              
-              // If we have a prompt in parameters but not in storage, store it
-              if (promptFromParams && !activeCallPrompts.has(callSid)) {
-                activeCallPrompts.set(callSid, {
-                  prompt: promptFromParams,
-                  timestamp: new Date(),
-                  used: false
-                });
-              }
             }
+            
             console.log('Media stream started:', streamSid);
             initializeOpenAI();
             break;
@@ -395,7 +391,7 @@ fastify.register(async function (fastify) {
     });
 
     // Handle WebSocket closure
-    connection.on('close', () => {
+    connection.socket.on('close', () => {
       console.log('Twilio WebSocket closed');
       if (openAiWs?.readyState === WebSocket.OPEN) {
         openAiWs.close();
