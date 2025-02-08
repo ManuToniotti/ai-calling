@@ -147,7 +147,7 @@ fastify.all('/incoming-call', async (request, reply) => {
   reply.type('text/xml').send(twimlResponse);
 });
 
-// WebSocket handler
+// WebSocket handler for media streaming
 fastify.register(async function (fastify) {
   fastify.get('/media-stream', { websocket: true }, function wsHandler(connection, req) {
     console.log('New WebSocket connection established');
@@ -159,7 +159,10 @@ fastify.register(async function (fastify) {
     let currentMessageId = null;
     let completeMessage = '';
     let isSpeaking = false;
-    let isProcessingTranscript = false;
+
+    function createSystemMessage(customPrompt) {
+      return customPrompt || 'No specific task provided.';
+    }
 
     // Initialize OpenAI connection
     function initializeOpenAI() {
@@ -173,43 +176,52 @@ fastify.register(async function (fastify) {
             }
           }
         );
-
+    
         openAiWs.on('open', () => {
           console.log('Connected to OpenAI');
           let prompt = null;
-          
-          // Get prompt from stored data
+    
+          // Check for prompt in various places
           if (streamSid) {
             const callSid = streamToCallSid.get(streamSid);
             if (callSid) {
               const storedPromptData = activeCallPrompts.get(callSid);
               if (storedPromptData && !storedPromptData.used) {
                 prompt = storedPromptData.prompt;
+                storedPromptData.used = true;  // Mark as used
                 console.log('Using stored prompt for call:', prompt);
               }
             }
           }
-
-          // Send session update
+    
+          // Create comprehensive system message
+          const systemMessage = `${SYSTEM_MESSAGE}
+          
+          Your specific task for this call is: ${prompt || 'No specific task provided.'}
+          
+          Remember to:
+          1. Focus on completing this specific task
+          2. Be professional and courteous
+          3. End the call appropriately when the task is complete`;
+          
           const sessionUpdate = {
             type: 'session.update',
             session: {
               turn_detection: { 
                 type: 'server_vad',
-                threshold: 0.5,
-                silence_duration_ms: 400,
-                prefix_padding_ms: 200
+                threshold: 0.5
               },
               input_audio_format: 'g711_ulaw',
               output_audio_format: 'g711_ulaw',
               voice: VOICE,
-              instructions: customPrompt ? `${SYSTEM_MESSAGE}\n\nYour specific task for this call is: ${customPrompt}` : SYSTEM_MESSAGE,
+              instructions: systemMessage,
               modalities: ["text", "audio"]
             }
           };
           
           openAiWs.send(JSON.stringify(sessionUpdate));
         });
+    
 
         openAiWs.on('message', async (data) => {
           try {
@@ -226,31 +238,28 @@ fastify.register(async function (fastify) {
                 }
                 break;
 
-              case 'input_audio_buffer.speech_started':
-                isSpeaking = true;
-                if (openAiWs.readyState === WebSocket.OPEN) {
-                  console.log('User started speaking - canceling AI response');
-                  
-                  // Cancel the current response
-                  if (currentResponseId) {
+                case 'input_audio_buffer.speech_started':
+                  isSpeaking = true;
+                  if (openAiWs.readyState === WebSocket.OPEN) {
+                    console.log('User started speaking - canceling AI response');
+                    
+                    // Send cancel response
                     openAiWs.send(JSON.stringify({
-                      type: 'response.cancel',
-                      response_id: currentResponseId
+                      type: 'response.cancel'
                     }));
+                
+                    // Clear the media buffer
+                    if (streamSid) {
+                      connection.send(JSON.stringify({
+                        event: 'clear',
+                        streamSid: streamSid
+                      }));
+                    }
+                
+                    // Reset message tracking
+                    completeMessage = '';
                   }
-
-                  // Clear the media buffer
-                  if (streamSid) {
-                    connection.send(JSON.stringify({
-                      event: 'clear',
-                      streamSid: streamSid
-                    }));
-                  }
-
-                  // Reset message tracking
-                  completeMessage = '';
-                }
-                break;
+                  break;
 
               case 'input_audio_buffer.speech_stopped':
                 isSpeaking = false;
@@ -267,22 +276,19 @@ fastify.register(async function (fastify) {
                 break;
 
               case 'response.audio_transcript.delta':
-                if (response.delta && !isSpeaking) {
+                if (response.delta) {
                   completeMessage += response.delta;
                   
                   if (completeMessage.match(/[.!?](\s|$)/)) {
-                    const message = completeMessage.trim();
-                    if (message && !conversation.some(msg => msg.content === message)) {
-                      console.log('Assistant:', message);
-                      conversation.push({ role: 'assistant', content: message });
-                    }
+                    console.log('Assistant:', completeMessage.trim());
+                    conversation.push({ role: 'assistant', content: completeMessage.trim() });
                     completeMessage = '';
                   }
                   
                   if (completeMessage.includes('[END_CALL]')) {
                     console.log('Call ending sequence detected');
                     setTimeout(() => {
-                      if (connection.socket.readyState === WebSocket.OPEN) {
+                      if (connection.socket) {
                         connection.socket.close();
                       }
                       if (openAiWs?.readyState === WebSocket.OPEN) {
@@ -294,27 +300,17 @@ fastify.register(async function (fastify) {
                 break;
 
               case 'conversation.item.input_audio_transcription.completed':
-              case 'input_audio_buffer.transcription.completed':
-                if (response.transcript && !isProcessingTranscript) {
-                  isProcessingTranscript = true;
+                if (response.transcript) {
                   const userMessage = response.transcript.trim();
                   if (userMessage) {
                     console.log('User:', userMessage);
-                    if (!conversation.some(msg => 
-                      msg.role === 'user' && msg.content === userMessage
-                    )) {
-                      conversation.push({ role: 'user', content: userMessage });
-                    }
+                    conversation.push({ role: 'user', content: userMessage });
                   }
-                  isProcessingTranscript = false;
                 }
                 break;
 
               case 'error':
-                if (!response.error?.message?.includes('Cancellation failed') && 
-                    !response.error?.message?.includes('Audio content')) {
-                  console.error('OpenAI error:', response.error);
-                }
+                console.error('OpenAI error:', response.error);
                 break;
             }
           } catch (error) {
@@ -329,14 +325,14 @@ fastify.register(async function (fastify) {
         openAiWs.on('close', (code, reason) => {
           console.log('OpenAI WebSocket closed:', code, reason ? reason.toString() : '');
           
-          if (streamSid) {
-            const callSid = streamToCallSid.get(streamSid);
-            if (callSid) {
-              activeCallPrompts.delete(callSid);
-              streamToCallSid.delete(streamSid);
-            }
+          // Clean up maps
+          const callSid = streamToCallSid.get(streamSid);
+          if (callSid) {
+            activeCallPrompts.delete(callSid);
+            streamToCallSid.delete(streamSid);
           }
 
+          // Log final conversation
           if (conversation.length > 0) {
             console.log('\nFinal conversation transcript:');
             conversation.forEach(msg => {
@@ -350,7 +346,7 @@ fastify.register(async function (fastify) {
       }
     }
 
-    // Handle Twilio messages
+    // Handle messages from Twilio
     connection.on('message', async function handleMessage(rawMessage) {
       try {
         const data = JSON.parse(rawMessage.toString());
@@ -358,13 +354,23 @@ fastify.register(async function (fastify) {
         switch (data.event) {
           case 'start':
             streamSid = data.start.streamSid;
+            // Get CallSid from start event's customParameters
             const callSid = data.start.customParameters?.CallSid;
+            const promptFromParams = data.start.customParameters?.Prompt;
             
             if (callSid) {
               streamToCallSid.set(streamSid, callSid);
               console.log('Mapped stream', streamSid, 'to call', callSid);
+              
+              // If we have a prompt in parameters but not in storage, store it
+              if (promptFromParams && !activeCallPrompts.has(callSid)) {
+                activeCallPrompts.set(callSid, {
+                  prompt: promptFromParams,
+                  timestamp: new Date(),
+                  used: false
+                });
+              }
             }
-            
             console.log('Media stream started:', streamSid);
             initializeOpenAI();
             break;
